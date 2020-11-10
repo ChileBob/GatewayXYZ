@@ -1,0 +1,700 @@
+#!/usr/bin/perl
+# 
+# Copyright 2020 ChileBob
+# 
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files 
+# (the "Software"), to deal in the Software without limitation the rights to use, copy, modify, merge, publish, distribute, sublicence
+# and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES 
+# OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+# LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITIES, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF
+# OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+# Version 0.0.1-alpha
+
+use strict;
+
+my $installdir = "$ENV{'HOME'}";									# Default installation directory
+my $debug = 1;												# debug level (0 = none, 1 = write to xyx.log)
+my $enabled = 1;											# 1 = will post & send
+
+#####################################################################################################################################################################################################
+# DONT CHANGE ANYTHING BELOW THIS LINE 
+#####################################################################################################################################################################################################
+
+use utf8;
+use Encode qw( encode_utf8 );
+use JSON;												# general purpose JSON
+use String::HexConvert ':all';										# used to decode memo field on zaddr transactions
+use Data::Dumper;											# debugging output, can be deleted
+use YAML qw(DumpFile LoadFile);
+use Reddit::Client;
+use Twitter::API;
+use JSON;
+use LWP::Simple qw/get/;
+
+use HTTP::Request::Common;
+use LWP::UserAgent;
+use Digest::SHA qw(sha256);
+use File::Path qw(make_path);
+use URL::Encode qw(url_encode);
+
+open (DEBUG, ">>/tmp/xyz.debug") || die ("Cant open /tmp/xyz.debug");					# open debug file
+
+my ($rx_coin, $rx_txid) = @ARGV;									# grab the command line args
+if (!$rx_coin || !$rx_txid) {										# make sure we were called correctly
+	print "Usage: xyz  ZEC|YEC txid\n";								# TODO: Make this better, there are only two args & we know much about what they are
+	exit(0);
+}
+
+my $config_xyz = config_load("$ENV{'HOME'}/xyz-gateway/xyz.conf");					# load config file
+my $config;												# cached config
+set_config($rx_coin, 'RX');										# set config for receiving
+
+open (CACHE, "<$config_xyz->{'rootdir'}/$config_xyz->{'cache'}");								# load cache file
+my @cache = <CACHE>;
+close (CACHE);
+
+if (grep(/$rx_txid/, @cache)) {										# exit if txid has been cached
+	&debug("Already processed this txn");
+	exit(0);
+}
+
+my $txid = node($config->{'rx_client'}, 'gettransaction', "$rx_txid"); 					# get incoming transaction 
+if (ref($txid) ne 'HASH') {										# if its not a hash we cant read the txn
+	&debug("Invalid txid, external txn, or the node is DOWN");
+	exit(0);
+}
+
+else {
+	if ( ($txid->{'confirmations'} < $config_xyz->{'conf_max'}))  {					# dont process old transactions, no need
+
+		my $txn_all = node($config->{'rx_client'}, 'z_listreceivedbyaddress', "$config->{'rx_addr'} 0" );		# get all shielded txns for receive address, including unconfirmed
+
+		if (ref($txn_all) eq 'ARRAY') {
+
+			foreach my $txn (@$txn_all) {											# now step through them
+	
+				if ( ($txn->{'txid'} eq $rx_txid) && ($txn->{'amount'} >= 0) ) {					# look for matching txid with positive (or zero) amount attached
+	
+					&cache_txid($rx_txid);										# cache the txid so we dont have to process it again
+	
+					if ($txn->{'memo'} !~ m/^f6/i) {								# memo must contain something, otherwise we can skip everything
+	
+						my $raw = hex_to_ascii($txn->{'memo'});							# decode the hex-encoded memo
+						$raw =~ s/\0//g;									# strip all null chars
+						my @decoded  = split(/\n/,$raw);							# split memo into lines
+						my $lines = @decoded;									# ...and get a count of the lines
+
+						my $addr_reply = $decoded[($lines-1)];							# extract reply-to address (check last line)
+						$addr_reply =~ s/[^[:ascii:]]//g;							# strip anything thats not ascii from the reply address, just in case
+	
+						my $validate = &node($config->{'rx_client'}, 'z_validateaddress', $decoded[($lines-1)]);	# validate the reply
+						if (!$validate->{'isvalid'}) {									# clear if invalid so the bounce sub can ignore it
+							$addr_reply = '';
+						}
+	
+						my $firstline = uc($decoded[0]);								# first line can be a zec/yec address or REDDIT
+						$firstline =~ s/\s//g;
+	
+						my $secondline = $decoded[1];									# second line can be a phone number (NumberProtector), or a subject (email)
+						$secondline =~ s/[^0-9]//g;
+	
+						if ($firstline eq 'REDDIT' ) {									# FORWARD INCOMING MEMO TO REDDIT 
+							&debug("Posting to Reddit");
+	
+							if ( ($txn->{'amount'} < $config->{'fee_reddit'}) && ($txn->{'amount'} > 0) ) {
+	
+								&debug("Insufficient funds ($txn->{'amount'} $config->{'rx_coin'})");
+	
+								set_config($rx_coin, 'TX');	 			
+								&bounce($config->{'tx_client'}, $txn->{'amount'}, $config->{'tx_fee'}, $config->{'tx_addr'}, $addr_reply, "Insufficient funds.\n\nYou sent $txn->{'amount'} $config->{'rx_coin'}, however $config->{'fee_reddit'} $config->{'rx_coin'} is required.\n\nYour funds have been returned, minus the mining fee.");
+							}
+							else {
+								my $content = join("\n", @decoded[2..($lines-1)]);				# title is second line, content follows, there may be a replyto address
+	
+								$content .= "\n\n------------------------------------------------------------------\n\nYou can post to $config_xyz->{'reddit_sub'} by sending an encrypted memo with \'REDDIT\' on the first line to the following addresses :-\n\nZEC : $config_xyz->{'z_addr'}\n\nYEC : $config_xyz->{'y_addr'}\n\n";
+	
+								&reddit_post_text($decoded[1], $content);					# post to reddit, one try, no retries or error checking, ugly ugly ugly
+								exit(0);
+							}
+						}
+	
+	
+						elsif ($firstline eq 'TWITTER' ) {								# TWEET MEMO 
+							&debug("Posting to Twitter");
+	
+							if ( ($txn->{'amount'} < $config->{'fee_twitter'}) && ($txn->{'amount'} > 0) ) {
+	
+								&debug("Insufficient funds ($txn->{'amount'} $config->{'rx_coin'})");
+	
+								set_config($rx_coin, 'TX');	 			
+								&bounce($config->{'tx_client'}, $txn->{'amount'}, $config->{'tx_fee'}, $config->{'tx_addr'}, $addr_reply, "Insufficient funds.\n\nYou sent $txn->{'amount'} $config->{'rx_coin'}, however $config->{'fee_twitter'} $config->{'rx_coin'} is required.\n\nYour funds have been returned, minus the mining fee.");
+							}
+							else {
+								my $content = join("\n", @decoded[1..($lines-1)]);				# title is second line, content follows, there may be a replyto address
+								tweet($rx_coin, $content);							
+								exit(0);
+							}
+						}
+	
+						elsif ($firstline eq 'TELEGRAM' ) {								# TELEGRAM
+							&debug("Posting to Telegram");
+	
+							if ( ($txn->{'amount'} < $config->{'fee_telegram'}) && ($txn->{'amount'} > 0) ) {
+	
+								&debug("Insufficient funds ($txn->{'amount'} $config->{'rx_coin'})");
+	
+								set_config($rx_coin, 'TX');	 			
+								&bounce($config->{'tx_client'}, $txn->{'amount'}, $config->{'tx_fee'}, $config->{'tx_addr'}, $addr_reply, "Insufficient funds.\n\nYou sent $txn->{'amount'} $config->{'rx_coin'}, however $config->{'fee_telegram'} $config->{'rx_coin'} is required.\n\nYour funds have been returned, minus the mining fee.");
+							}
+							else {
+								my $content = uc("$rx_coin encrypted memo\n\n");
+								$content .= join("\n", @decoded[1..($lines-1)]);				# title is second line, content follows, there may be a replyto address
+	
+								my $chat_id;
+								my $updates = telegram('getUpdates');						# read updates
+								foreach my $update (@{ $updates->{result} }) {					# get the channel chat ID
+									if (exists($update->{'channel_post'})) {
+										$chat_id = $update->{'channel_post'}->{'chat'}->{'id'};
+									}
+								}
+								telegram('sendMessage', { chat_id => $config_xyz->{'telegram_chatid'}, text => $content });		# post message to channel
+								exit(0);
+							}
+						}
+	
+						elsif ($firstline eq 'ALL' ) {									# SEND TO ALL FREE CHANNELS
+							&debug("Posting to all channels");
+	
+							if ( ($txn->{'amount'} < $config->{'fee_all'}) && ($txn->{'amount'} > 0) ) {
+		
+								&debug("Insufficient funds ($txn->{'amount'} $config->{'rx_coin'})");
+	
+								set_config($rx_coin, 'TX');	 			
+								&bounce($config->{'tx_client'}, $txn->{'amount'}, $config->{'tx_fee'}, $config->{'tx_addr'}, $addr_reply, "Insufficient funds.\n\nYou sent $txn->{'amount'} $config->{'rx_coin'}, however $config->{'fee_twitter'} $config->{'rx_coin'} is required.\n\nYour funds have been returned, minus the mining fee.");
+							}
+							else {
+	
+								my $content = join("\n", @decoded[1..($lines-1)]);				# TWITTER 
+								tweet($rx_coin, $content);							#	
+	
+								$content = uc("$rx_coin encrypted memo\n\n");					# TELEGRAM
+								$content .= join("\n", @decoded[1..($lines-1)]);				# 
+								$content =~ s/^\s+//;								#
+																		#
+								telegram('sendMessage', { chat_id => $config_xyz->{'telegram_chatid'}, text => $content });		# 
+	
+								$content = join("\n", @decoded[2..($lines-1)]);					# REDDIT
+								$content .= "\n\n------------------------------------------------------------------\n\nYou can post to $config_xyz->{'reddit_sub'} by sending an encrypted memo with \'REDDIT\' on the first line to the following addresses :-\n\nZEC : $config_xyz->{'z_addr'}\n\nYEC : $config_xyz->{'y_addr'}\n\n";
+	
+								&reddit_post_text($decoded[1], $content);					# 
+								exit(0);
+							}
+						}
+	
+						elsif ($firstline =~ m/\@/) {									# EMAIL !!!!
+	
+							$firstline = lc($firstline);
+	
+							if ($addr_reply eq '') {								# must have a reply address
+								&debug("Email : No reply address, cant bounce, giving up");
+								exit(0);
+							}
+							elsif ( ($txn->{'amount'} < $config->{'fee_mailjet'}) && ($txn->{'amount'} > 0) ) { 		# confirm min amount received with message
+								&debug("Email : Insufficient funds ($txn->{'amount'} $config->{'rx_coin'})");
+	
+								set_config($rx_coin, 'TX');	 			
+								&bounce($config->{'tx_client'}, $txn->{'amount'}, $config->{'tx_fee'}, $config->{'tx_addr'}, $addr_reply, "Insufficient funds.\n\nYour email to $firstline was not sent.\n\nYou sent $txn->{'amount'} $config->{'rx_coin'}, however $config->{'fee_forward'} $config->{'rx_coin'} is required.\n\nYour funds have been returned, minus the mining fee.");
+							}
+							else {
+								my $content = join("\n", @decoded[2..($lines-1)]);				
+								my $response = &mailjet_send ($firstline, $decoded[1], $content, $addr_reply, $txn->{'txid'});	# deliver emails via MailJet
+							}
+						}
+	
+	
+						else {												# DEFAULT IS TO FORWARD TO CRYPTO NETWORKS
+	
+							my $address = $decoded[0];								# first line must be a valid address or a zecpages shortname
+	
+							if ($address =~ m/^zs1/) {								# sending to ZEC zaddr
+								set_config('ZEC', 'TX');	
+							}
+							elsif ($address =~ m/^ys1/) {								# sending to YEC yaddr
+								set_config('YEC', 'TX');	
+							}
+							else {											# maybe a zecpages name
+								$address =~ s/^[^_]*\///;							# strip everything before the / char
+								&debug("looking up zecpages zaddr for $address");
+								$address = get_zecpages($address);						# look up the zaddr
+								if ($address =~ m/^zs1/) {							# yaay! found it
+									set_config('ZEC', 'TX');	
+								}
+								else {										# screwed, no destination address
+									set_config($rx_coin, 'TX');	 			
+									&bounce($config->{'tx_client'}, $txn->{'amount'}, $config->{'tx_fee'}, $config->{'tx_addr'}, $addr_reply, "No forwarding address.\n\nThe first line of your message must contain a ZEC z-address, a YEC y-address or a ZecPages z2z name.\n");
+									exit(0);
+								}
+							}					
+	
+							$validate = &node($config->{'tx_client'}, 'z_validateaddress', $address);		# validate it
+							if (!$validate->{'isvalid'}) {								# if its not a valud destination address, bounce
+	
+								&debug("Invalid address : $address");
+	
+								set_config($rx_coin, 'TX');	 			
+								&bounce($config->{'tx_client'}, $txn->{'amount'}, $config->{'tx_fee'}, $config->{'tx_addr'}, $addr_reply, "Bad forwarding address ($address).\n\nThe forwarding address is not valid, sorry.\n");
+							}
+			
+							elsif ( ($txn->{'amount'} < $config->{'fee_forward'}) && ($txn->{'amount'} > 0) ) { 	# confirm min amount received with message
+	
+								&debug("Insufficient funds ($txn->{'amount'} $config->{'rx_coin'})");
+	
+								set_config($rx_coin, 'TX');	 			
+								&bounce($config->{'tx_client'}, $txn->{'amount'}, $config->{'tx_fee'}, $config->{'tx_addr'}, $addr_reply, "Insufficient funds.\n\nYou sent $txn->{'amount'} $config->{'rx_coin'}, however $config->{'fee_forward'} $config->{'rx_coin'} is required.\n\nYour funds have been returned, minus the mining fee.");
+							}
+			
+							else {											# OK, we're good, send the message !
+								$decoded[0] = "Via: $config_xyz->{'service'}\n";				# remove dest address & replace with something useful
+								my $memo    = join("\n", @decoded);						# assemble the new memo
+								my $memo_encoded = substr(ascii_to_hex($memo),0,1024);				# hex-encode & limit length to 1024 chars (512 bytes)
+						
+								&debug("Forwarding to $address");
+								&node($config->{'tx_client'}, 'z_sendmany', "\"$config->{'tx_addr'}\" \'\[\{\"address\"\: \"$address\" ,\"amount\"\: $config->{'tx_value'} ,\"memo\"\: \"$memo_encoded\"\}\]\' 1 $config->{'tx_fee'}");
+							}
+						}
+	
+					}
+				}
+			}
+		}
+	}
+	else {
+		&debug("Too many confirmations, aborting.");
+	}
+}
+
+close (DEBUG);												# close cache file
+exit;														
+
+
+#####################################################################################################################################################################################################
+# Usage: &config_load( $filename );									Load/Reload config file
+
+sub bounce {
+
+	my ($client, $amount, $fee, $addr_from, $addr_to, $memo) = @_;
+
+	if ($addr_to) {
+		if (($amount - $fee) >= 0) {
+			$amount = sprintf("%.8f", ($amount - $fee));
+			my $memo_encoded = substr(ascii_to_hex("$config_xyz->{'service'} : Your message could not be forwarded\n\n$memo\n\nReply to:\n$config->{'rx_addr'}"),0,1024);	# encode & truncate to 512 bytes
+			&node($client, 'z_sendmany', "\"$addr_from\" \'\[\{\"address\"\: \"$addr_to\" ,\"amount\"\: $amount ,\"memo\"\: \"$memo_encoded\"\}\]\' 1 $fee");
+			&debug("Returning $amount");
+		}
+		else {
+			&debug("Not enough value attached to mine returned message");
+		}
+	}
+	else {
+		&debug("No Reply-To address provided :-(");
+	}
+}
+
+#####################################################################################################################################################################################################
+# Usage: &config_load( $filename );									Load/Reload config file
+
+sub config_load {
+
+	my ($filename) = @_;										# note: filename MUST be a full pathname
+
+	my %config;
+	open (CONFIG, "$filename") || die ("Cant open $filename");					# load/parse the config file
+	while (my $line = <CONFIG>) {
+		chop($line);
+		$line =~ s/\#.*//;									# strip comments
+		my @conf = split('=', $line);
+		$conf[0] =~ s/\s//g;									# strip whitespace from keyword
+		$conf[1] =~ s/\"//g;									# strip opening/closing double quotes on values
+		$conf[1] =~ s/^\s//g;									# strip leading whitespace on value
+		$conf[1] =~ s/\s*$//g;									# strip trailing whitespace on value
+		if ($conf[0]) {										# add to hash if keyword is valid
+			$config{$conf[0]} = $conf[1];
+		}
+	}
+	close (CONFIG);
+
+	return(\%config);										# return config as a hashref
+}
+
+
+#####################################################################################################################################################################################################
+# Usage: node( config, method, params);									Talk to node RPC server
+
+sub node {
+
+	my ($client, $command, $args) = @_;
+
+	my $result = '';
+	if ( ($command eq 'z_sendmany') && ($enabled == 0) )  {
+		&debug("node() : DISABLED\n$client $command $args");
+	}
+	else {
+		$result = `$client $command $args 2>/dev/null`;							# I know, every time you use backticks a puppy dies (JSON::RPC::Client doesnt work for ZEC/YEC!)
+	}
+
+	my $json = eval { decode_json($result) };							# make sure we get proper JSON, anything else is FAIL
+	if ($@) { 
+		my %error = { status => 0 };
+		return(\%error);
+	}
+	return(decode_json($result));									# return decoded result
+}
+
+#####################################################################################################################################################################################################
+# Usage: &debug(message, var);										Print debugging messages
+#
+sub debug {
+
+	my ($message, $var) = @_;
+
+	if ($debug > 0) {										# print the message (debug = 1)
+		print DEBUG "$config->{'rx_coin'} : $rx_txid : $message\n";
+	}
+
+	if ( ($var) && ($debug > 1)) {									# print the var (debug = 2)
+		print DEBUG Dumper $var;
+	}
+}
+
+#####################################################################################################################################################################################################
+# Usage: &reddit_post_link(title, link);								Post link to reddit
+#
+sub reddit_post_link {
+
+	my ($title, $url) = @_;
+
+	if ($enabled > 0) {
+		my $client = Reddit::Client->new(								# connect client
+			user_agent => 'Test script v0.01 by /u/chilebob',
+			client_id  => $config_xyz->{'reddit_client'},
+			secret     => $config_xyz->{'reddit_secret'},
+			username   => $config_xyz->{'reddit_user'},
+			password   => $config_xyz->{'reddit_pass'},
+		);
+	
+		my $response = $client->submit_link(								# post link
+			subreddit => $config_xyz->{'reddit_sub'},
+			title     => $title,
+			url       => $url
+		);
+	}
+	else {
+		&debug("reddit_post_link() : POSTING DISABLED\n$title\n$url");
+	}
+}
+
+
+#####################################################################################################################################################################################################
+# Usage: &reddit_post_text(title, text);								Post text to reddit
+#
+sub reddit_post_text {
+
+	my ($title, $text) = @_;
+
+	if ($title eq '') {
+		$title = "No subject";
+	}
+
+	if ($enabled > 0) {
+		my $client = Reddit::Client->new(								# connect client
+			user_agent => 'Test script v0.01 by /u/chilebob',
+			client_id  => $config_xyz->{'reddit_client'},
+			secret     => $config_xyz->{'reddit_secret'},
+			username   => $config_xyz->{'reddit_user'},
+			password   => $config_xyz->{'reddit_pass'},
+		);
+	
+		my $response = $client->submit_text(								# post text 
+			subreddit => $config_xyz->{'reddit_sub'},
+			title     => $title,
+			text      => $text,
+			[ inbox_replies => 0 ]
+		);
+	}
+	else {
+		&debug("reddit_post_text() : DISABLED\n$title\n$text");
+	}
+}
+
+
+#####################################################################################################################################################################################################
+# Usage: &cache_txid(txid);										Add TXID to cache
+#
+sub cache_txid {
+
+	open (CACHE, ">>$config_xyz->{'rootdir'}/$config_xyz->{'cache'}") || die;						# open cache file for exclusive write
+	flock(CACHE, 2) || die;										# exclusive write, which blocks
+	print CACHE "$rx_txid\n";									# - add it
+	close (CACHE);											# - close cache (releases file lock)
+}
+
+
+#####################################################################################################################################################################################################
+# Usage: &config_send (coin, direction)
+#
+sub set_config {
+
+	my $coin = uc($_[0]);
+	my $dir  = uc($_[1]);
+
+	if ($dir eq 'TX') {			# SEND
+		$config->{'tx_coin'} = $coin;
+		if ($coin eq 'ZEC') {
+			$config->{'tx_client'}   = $config_xyz->{'z_client'};		# full path to RPC client
+			$config->{'tx_addr'}     = $config_xyz->{'z_addr'};		# gateway zaddr to send funds from
+			$config->{'tx_value'}    = $config_xyz->{'z_value'};		# send value
+			$config->{'tx_fee'}      = $config_xyz->{'z_fee'};		# mining fee
+		}
+		elsif ($coin eq 'YEC') {
+			$config->{'tx_client'}   = $config_xyz->{'y_client'};		#	 
+			$config->{'tx_addr'}     = $config_xyz->{'y_addr'};		#
+			$config->{'tx_value'}    = $config_xyz->{'y_value'};		#
+			$config->{'tx_fee'}      = $config_xyz->{'y_fee'};		#
+		}
+	}
+	elsif ($dir eq 'RX') {			# RECEIVE
+		$config->{'rx_coin'} = $coin;
+		if ($coin eq 'ZEC') {	
+			$config->{'rx_client'}   = $config_xyz->{'z_client'};		# full path to RPC client
+			$config->{'rx_addr'}     = $config_xyz->{'z_addr'};		# receiving address
+			$config->{'fee_forward'} = $config_xyz->{'forward_fee_z'};	# fee - forwarding
+			$config->{'fee_reddit'}  = $config_xyz->{'reddit_fee_z'};	# fee - post to reddit
+			$config->{'fee_mailjet'} = $config_xyz->{'mailjet_fee_z'};	# fee - email forwarding
+			$config->{'fee_twitter'} = $config_xyz->{'twitter_fee_z'};	# fee - post to Twitter
+			$config->{'fee_telegram'} = $config_xyz->{'telegram_fee_z'};	# fee - post to Telegram
+			$config->{'fee_all'}      = $config_xyz->{'all_fee_z'};		# fee - post to all channels
+		}
+		elsif ($coin eq 'YEC') {
+			$config->{'rx_client'}   = $config_xyz->{'y_client'};		#
+			$config->{'rx_addr'}     = $config_xyz->{'y_addr'};		#
+			$config->{'fee_forward'} = $config_xyz->{'forward_fee_y'};	#
+			$config->{'fee_reddit'}  = $config_xyz->{'reddit_fee_y'};	#
+			$config->{'fee_mailjet'} = $config_xyz->{'mailjet_fee_y'};	# 
+			$config->{'fee_twitter'} = $config_xyz->{'twitter_fee_y'};	# 
+			$config->{'fee_telegram'} = $config_xyz->{'telegram_fee_y'};	# 
+			$config->{'fee_all'}      = $config_xyz->{'all_fee_y'};		# 
+		}
+	}
+}
+
+
+#####################################################################################################################################################################################################
+# Usage: &get_zecpages 
+#
+sub get_zecpages {
+
+	my ($username) = @_;
+	
+	my $cache = '';
+
+	if (-e $config_xyz->{'zecpages_cache'}) {					# look for cache
+		my @filestat = stat($config_xyz->{'zecpages_cache'});			# get file details
+		if ( (time - $filestat[9]) < $config_xyz->{'zecpages_refresh'}) {	# check its age
+			$cache = LoadFile($config_xyz->{'zecpages_cache'});		# not stale, so load it
+		}
+	}
+
+	if (!$cache) {									# cache is stale if true
+		my $result = get $config_xyz->{'zecpages_api'};				# query zecpages
+		my $json = eval { decode_json($result) };				# make sure we have proper JSON, or perl dies horribly
+		if ($@) { 								# JSON is bad
+			if (-e $config_xyz->{'zecpages_cache'}) {			# load stale cache, better than nothing
+				$cache = LoadFile($config_xyz->{'zecpages_cache'});		
+			}
+		}
+		else {									# Woo! Fresh decodable JSON 
+			$cache = decode_json($result);					# decode 
+			DumpFile($config_xyz->{'zecpages_cache'}, $cache);		# cache it
+		}
+	}
+
+	foreach my $card (@$cache) {							# search through everything for out username
+		if ($card->{'username'} eq $username) {
+			return($card->{'zaddr'});					# return the zaddr
+		}
+	}
+}
+
+
+#####################################################################################################################################################################################################
+# Usage: &tweet (coin, message); 
+#
+sub tweet {
+
+	my ($coin, $message) = @_;
+	$coin = uc($coin);
+
+	my @tweets;
+
+	my $client = Twitter::API->new_with_traits(
+		traits              => 'Enchilada',
+		consumer_key        => $config_xyz->{'twitter_consumer_key'},
+		consumer_secret     => $config_xyz->{'twitter_consumer_secret'},
+		access_token	    => $config_xyz->{'twitter_access_token'},
+		access_token_secret => $config_xyz->{'twitter_access_token_secret'} 
+	);
+
+	#TODO: Confirm that we're logged in, if not report the problem to debug
+#	my $me    = $client->verify_credentials;
+	
+	$message =~ s/\@//g;	# remove tags that trigger external action
+	$message =~ s/\#//g;	#
+
+	if ($coin eq 'ZEC')    { 							
+		@tweets = make_tweets($message, "Sent by : \#zcash \#$config_xyz->{'service'}");
+	}
+	elsif ($coin eq 'YEC') { 
+		@tweets = make_tweets($message, "Sent by : \#ycash \#$config_xyz->{'service'}");
+	}
+
+	foreach my $tweet (@tweets) {
+		&debug("Twitter : $message");
+		my $response = eval { $client->update($tweet) };				# send tweet, wrapped with eval just in case API barfs
+	}
+}
+
+#####################################################################################################################################################################################################
+# Usage: my @tweets = &make_tweets (message, footer); 						# chop message into tweet sized chunks & add a footer
+#
+sub make_tweets {
+
+	my ($message, $footer) = @_;								# read args
+
+	my $footer_size  = length("\n\n$footer");						# max size of footer
+	my @words = split(/ /, $message);							# number of words
+
+	my @tweets;										# array of tweets
+	my $tweet;										# tweet content
+
+	if ( (length($message) + $footer_size + 2) < 280) {					# fit in one tweet ?
+		push @tweets,  "$message\n\n$footer";						# create array with ONE tweet
+		return (@tweets);								# return array of tweets
+	}
+
+
+	while (scalar (@words)) {								# process one word at a time
+
+		if ( (length($tweet) + length($words[0]) + $footer_size + 2) <= 272) {		# check adding the next word will fit
+			$tweet .= "$words[0] ";							# add it
+			shift(@words);								# remove from array of words
+		}
+		else {										# nope, the tweet is full
+			push @tweets, "$tweet (cont)\n\n$footer";				# append the footer & add to array
+			$tweet = '(cont) ';							# start next installment
+		}
+	}
+
+	if (length($tweet) > 7) {								# partial tweet remaining ? excluding the '(cont) '
+		push @tweets,  "$tweet\n\n$footer";						# append to array
+	}
+	return (@tweets);									# return array of tweets
+}
+
+
+# Usage : mailjet_send (to, subject, message, from, txid);				# deliver emails via MailJet
+#
+sub mailjet_send {
+
+	my ($to_addr, $subject, $message, $from_addr, $from_txid) = @_;
+
+	#	my $cache;
+	#if (-e $config_xyz->{'mailjet_cache'}) {							# load cache file, if it exists
+	#	$cache = LoadFile($config_xyz->{'mailjet_cache'});
+	#}
+	#else {										# no cache file, assume we're starting afresh
+	#	$cache->{'remaining'} = $config_xyz->{'mailjet_limit'};
+	#}
+
+	#foreach ($config_xyz->{'mailjet_sent'}, $config_xyz->{'mailjet_spool'}) {					# make sure temp dirs exist
+	#	if (!-d $_) { mkdir $_; }
+	#}
+
+	my $to_name = 'Unknown';							# we dont know the name
+
+	$to_addr = lc($to_addr);							# force email addr to a standard
+	$to_addr =~ s/\s//g;
+
+	#TODO: Prevent SPAM ??
+	# - respect daily sending limit
+	# - limit emails to a destination address per day (spool)
+	
+	my $from_coin = 'Zcash';							# derive sending network from address
+	if ($from_addr =~ m/^ys1/) {
+		$from_coin = 'Ycash';
+	}
+
+	my $sig = "\n\n----------------------- 8< ------------------------------\n";	# generate email sig
+        $sig .= "Received as a $from_coin encrypted memo and forwarded by GatewayXYZ using MailJet.\n\n";
+	$sig .= "Reply directly by $from_coin encrypted memo, email replies are not forwarded because email sucks!\n\n";
+	$sig .= "See https://reddit.com/r/GatewayXYZ for more information about GatewayXYZ.\n";
+
+	my $msg;									# generate sending info
+	$msg->{'FromEmail'}     = $config_xyz->{'mailjet_email'};
+	$msg->{'FromName'}      = $config_xyz->{'mailjet_name'};
+	$msg->{'Recipients'}[0] = { Email => $to_addr, Name => $to_name };
+	$msg->{'Subject'}       = $subject;
+	$msg->{'Mj-CustomID'}   = unpack("H*", sha256($from_txid));			# reference is hash of txid
+	$msg->{'Text-part'}     = "$message\n\n$sig\n";
+
+	my $encoded = encode_json($msg);						# encode into JSON
+
+	if ($enabled == 0) {								# bail out now if not enabled
+	#	DumpFile($config_xyz->{'mailjet_cache'}, $cache);
+		return(0);
+	}
+
+	&debug("Email : $to_addr : $message");
+	my $ua = LWP::UserAgent->new;							# send it to mailjet
+	my $request = POST $config_xyz->{'mailjet_api'}, Content_Type => [ 'application/json' ], Content => $encoded;
+	$request->authorization_basic($config_xyz->{'mailjet_user'}, $config_xyz->{'mailjet_pass'});
+
+	#	$cache->{'remaining'} = $cache->{'remaining'} - 1;				# update cache
+	#	DumpFile($config_xyz->{'mailjet_cache'}, $cache);
+
+	return($ua->request($request));							# return raw response
+}
+
+
+# Usage : telegram (method, params);				# post message on Telegram channel
+#
+sub telegram {
+
+	my ($method, $params) = @_;
+
+	my $encoded = '';
+	if ($params) {
+		$encoded .= '?';
+		my %params = %$params;
+		for my $key (keys(%params)) {
+			$encoded .= "\&$key=" . url_encode($params->{$key});
+		}
+	}
+
+	&debug("Telegram");
+	my $ua = LWP::UserAgent->new;							# create a user agent
+	my $request = POST "https://api.telegram.org/bot$config_xyz->{'telegram_token'}/$method$encoded", Content_Type => [ 'application/json' ], Content => '';
+
+	my $response = $ua->request($request);
+
+	my $decoded = eval { decode_json($response->content) };				# check for valid JSON or we die horribly
+	if ($@) {									# bad json, bad!!!
+	}
+	else {										# good json, so decode again & return it
+		return(decode_json($response->content));
+	}
+}
